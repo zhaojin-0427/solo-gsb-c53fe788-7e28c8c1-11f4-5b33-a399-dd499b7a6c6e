@@ -36,6 +36,14 @@ const state = {
   // cache key of the readouts currently shown: `${projectId}|${gen}|${time}`;
   // null means no readout may be reused yet (e.g. current eval failed)
   readoutKey: null,
+  // The exact playhead instant the on-screen readouts were evaluated for.
+  // A readout is trustworthy only while BOTH the project actually shown
+  // (state.project, not the pending selection state.projectId) is the same
+  // AND the playhead has not moved: while a detail request is in flight the
+  // playhead may jump to another instant, requestEval is then suspended, and
+  // the old instant's readout must be withdrawn at once rather than left
+  // beside the new playhead position.
+  readoutTime: null,
   dragging: false,
 };
 
@@ -142,6 +150,10 @@ async function openProject(id) {
     // project still on screen so the lanes, the editor, the selector and
     // every later eval keep describing the same project — the failure
     // must not leave mismatched readouts behind — then surface the error.
+    // Do NOT restore evalGen: the generation was bumped when the switch
+    // started, which already invalidated every cached / in-flight eval
+    // (including old-instant responses arriving late); restoring it would
+    // let a stale readout be mistaken for one of the rolled-back context.
     state.projectId = state.project ? state.project.id : null;
     if (state.projectId == null) {
       localStorage.removeItem("lightsProject");
@@ -150,6 +162,13 @@ async function openProject(id) {
       $("#projectSelect").value = String(state.projectId);
     }
     toast(e.message);
+    // The playhead may have moved while the failed detail was in flight
+    // (e.g. A shown at t0, B selected, head jumped to t1, B 404s).  Any
+    // readout left on screen is the old project's OLD-instant value;
+    // withdraw it and evaluate the restored project at the live instant,
+    // so the settled readout is A@t1 — never A@t0 beside the t1 head.
+    withdrawStaleReadout();
+    await requestEval(true);
     return;
   }
   // a newer selection superseded this request while it was in flight:
@@ -162,6 +181,7 @@ async function openProject(id) {
   // to an empty project leaves no stale channels on screen
   state.readouts = null;
   state.readoutKey = null;
+  state.readoutTime = null;
   renderReadouts();
   renderTimeline();
   renderEditor();
@@ -438,7 +458,18 @@ async function requestEval(immediate) {
   // already points at the next project, and evaluating it here would paint
   // its channels onto the lanes of the project still displayed.  The valid
   // detail response re-runs this for the live instant as soon as it lands.
-  if (!state.project || state.project.id !== state.projectId) return;
+  if (!state.project || state.project.id !== state.projectId) {
+    // Eval is suspended, but the playhead keeps moving (drag / seek /
+    // playback / jump).  The readout on screen belongs to the displayed
+    // project at an EARLIER instant: it stays valid only while the head
+    // sits at that same instant; once it moves, the old readout must be
+    // withdrawn immediately instead of lingering beside the new head
+    // position (where it would otherwise survive a failed switch that
+    // rolls the context back).  Nothing can replace it until a detail is
+    // applied — the landing / rollback path re-runs requestEval.
+    withdrawStaleReadout();
+    return;
+  }
   // the playhead is an arbitrary non-negative (possibly fractional) ms
   // value; send it verbatim — no rounding anywhere in the chain, so the
   // readout always matches a direct /eval call for this exact instant
@@ -478,11 +509,14 @@ async function requestEval(immediate) {
   try {
     const data = await api(
       `/api/projects/${pid}/eval?t=${encodeURIComponent(String(tq))}`);
-    // stale response guard: the project was switched or the data changed
-    // while the request was in flight.  Never overwrite the current view;
-    // queue a re-run only if nothing already covers the current instant,
-    // so the current data is evaluated without redundant requests.
-    if (pid !== state.projectId || gen !== state.evalGen) {
+    // stale response guard: the project was switched, the data changed
+    // OR the playhead moved to another instant while the request was in
+    // flight.  Never overwrite the current view with an old-instant
+    // readout; queue a re-run only if nothing already covers the current
+    // instant, so the current data is evaluated without redundant
+    // requests.
+    if (pid !== state.projectId || gen !== state.evalGen ||
+        tq !== state.time) {
       if (state.readoutKey !==
           `${state.projectId}|${state.evalGen}|${state.time}`) {
         state.evalQueued = true;
@@ -491,16 +525,20 @@ async function requestEval(immediate) {
     }
     state.readouts = data;
     state.readoutKey = key;
+    state.readoutTime = tq;
     renderReadouts();
   } catch (e) {
-    // only the request for the current project/data may touch the display;
-    // a stale failure must not wipe readouts belonging to a newer context
-    if (pid === state.projectId && gen === state.evalGen) {
+    // only the request for the current project/data/instant may touch the
+    // display; a stale failure must not wipe readouts belonging to a newer
+    // context (a newer project, newer data, or a later playhead instant)
+    if (pid === state.projectId && gen === state.evalGen &&
+        tq === state.time) {
       // current project can't be evaluated: drop the stale readout (its
       // channels may no longer exist) and surface the error; readoutKey
       // stays null so a later retry is not deduped away
       state.readouts = null;
       state.readoutKey = null;
+      state.readoutTime = null;
       renderReadouts();
       toast(e.message);
     }
@@ -508,7 +546,8 @@ async function requestEval(immediate) {
     // for unless a newer eval of the live context is already in flight or
     // its result is cached; the shared finally block only re-runs when
     // something got queued, so ask it here.
-    if ((pid !== state.projectId || gen !== state.evalGen) &&
+    if ((pid !== state.projectId || gen !== state.evalGen ||
+         tq !== state.time) &&
         !state.evalQueued &&
         state.readoutKey !==
         `${state.projectId}|${state.evalGen}|${state.time}`) {
@@ -526,6 +565,26 @@ async function requestEval(immediate) {
 // ---------------------------------------------------------------------------
 // Readouts
 // ---------------------------------------------------------------------------
+
+// A readout on screen is valid only for the project actually displayed
+// (state.project) at the instant it was evaluated (state.readoutTime).
+// Whenever that premise no longer holds — in practice: the playhead moved
+// to another instant while a project switch was in flight and requestEval
+// was therefore suspended — take the readout down immediately.  No toast
+// and no replacement request here: the detail landing / failure-rollback
+// path re-runs requestEval for the live instant.  Clearing readoutKey as
+// well guarantees the withdrawn readout can never be served from cache.
+function withdrawStaleReadout() {
+  const stillValid = state.readouts != null &&
+    state.readoutTime != null &&
+    state.readoutTime === state.time;
+  if (stillValid) return;
+  if (state.readouts == null && state.readoutKey == null) return;
+  state.readouts = null;
+  state.readoutKey = null;
+  state.readoutTime = null;
+  renderReadouts();
+}
 
 function renderReadouts() {
   const host = $("#readouts");
@@ -799,6 +858,7 @@ async function applyProjectPayload(payload) {
   // drop the old readout now so removed channels can't linger
   state.readouts = null;
   state.readoutKey = null;
+  state.readoutTime = null;
   renderReadouts();
   renderTimeline();
   renderEditor();

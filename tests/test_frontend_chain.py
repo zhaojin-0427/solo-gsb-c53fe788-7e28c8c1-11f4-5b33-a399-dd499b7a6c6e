@@ -26,7 +26,19 @@ the exact regressions that were fixed:
   the project still on screen so no mismatched readouts can be shown;
   and ``requestEval`` only evaluates the project whose detail is actually
   displayed, so an eval fired while a switch is in flight can never paint
-  the next project's channels onto the previous project's lanes.
+  the next project's channels onto the previous project's lanes;
+* while eval is thus suspended the playhead may still move (drag / seek /
+  jump / playback): the displayed readout belongs to the on-screen project
+  at an EARLIER instant, so it must be withdrawn as soon as the head leaves
+  that instant — it is valid only for "project on screen + that instant" —
+  and when the pending detail fails and the context rolls back, the
+  restored project is re-evaluated at the live instant, so the settled
+  readout is never the old instant's value parked beside the new head;
+* an eval response arriving after the playhead moved is an old-instant
+  response and must never be shown as the current readout (success nor
+  failure); only a response matching project, data generation AND instant
+  may touch the display, and every stale response arranges a fresh eval
+  of the live instant.
 """
 
 import re
@@ -130,11 +142,14 @@ class TestEvalDataGeneration(unittest.TestCase):
         # old channels (incl. empty target project) must not linger
         self.assertIn("state.readouts = null;", self.open)
         self.assertIn("state.readoutKey = null;", self.open)
-        clear_at = self.open.index("state.readouts = null;")
-        req_at = self.open.index("requestEval(true)")
+        # scope to the success path (after the last stale-ticket guard);
+        # the failure-rollback path legitimately re-evaluates too
+        applied = self.open.rsplit("if (seq !== state.openSeq) return;", 1)[1]
+        clear_at = applied.index("state.readouts = null;")
+        req_at = applied.index("requestEval(true)")
         self.assertLess(clear_at, req_at)
         # lanes are rebuilt against the new project before the clear/render
-        self.assertLess(self.open.index("buildLanes();"), clear_at)
+        self.assertLess(applied.index("buildLanes();"), clear_at)
 
     def test_mutation_clears_old_readouts_before_request(self):
         self.assertIn("state.readouts = null;", self.apply)
@@ -145,12 +160,15 @@ class TestEvalDataGeneration(unittest.TestCase):
 
     def test_inflight_stale_success_is_discarded(self):
         # an in-flight response must be checked against the CURRENT context
+        # AND the current playhead instant: a response for an earlier
+        # instant must never become the readout beside the moved head
         self.assertIn(
-            "if (pid !== state.projectId || gen !== state.evalGen)",
+            "if (pid !== state.projectId || gen !== state.evalGen ||\n"
+            "        tq !== state.time)",
             self.req)
         # locate the stale-success block (first occurrence of the guard)
         head = self.req.split(
-            "if (pid !== state.projectId || gen !== state.evalGen)", 1)[1]
+            "if (pid !== state.projectId || gen !== state.evalGen ||", 1)[1]
         block = head.split("return;", 1)[0]
         # ...must not overwrite state.readouts nor re-render...
         self.assertNotIn("state.readouts =", block)
@@ -162,14 +180,24 @@ class TestEvalDataGeneration(unittest.TestCase):
         self.assertIn(
             "`${state.projectId}|${state.evalGen}|${state.time}`", block)
 
+    def test_inflight_old_instant_response_never_displayed(self):
+        # the guard compares the request instant (tq) with the live head:
+        # an old-instant response, success or failure, is treated as stale
+        self.assertIn("tq !== state.time", self.req)
+        # and it may be applied only when every part matches — the apply
+        # block therefore sits AFTER the full three-part guard
+        guard = self.req.index("tq !== state.time")
+        applied = self.req.index("state.readouts = data;")
+        self.assertLess(guard, applied)
+
     def test_inflight_stale_failure_ignored(self):
         # a stale request's failure must not wipe the newer context's
-        # readouts nor toast its error
+        # readouts nor toast its error; "stale" includes an old instant
         m = re.search(
             r"catch \(e\) \{\s*//.*?if \(pid === state\.projectId &&\s*"
-            r"gen === state\.evalGen\) \{(.*?)\}\s*\}",
+            r"gen === state\.evalGen &&\s*tq === state\.time\) \{(.*?)\}\s*\}",
             self.req, re.S)
-        self.assertIsNotNone(m, "context-guarded catch block not found")
+        self.assertIsNotNone(m, "context+instant-guarded catch block not found")
         live_block = m.group(1)
         # clearing/toasting only happens inside the current-context guard
         self.assertIn("state.readouts = null;", live_block)
@@ -181,7 +209,8 @@ class TestEvalDataGeneration(unittest.TestCase):
         # a stale failure must still leave a queued re-run so the current
         # data is evaluated (only when nothing in flight / cached covers it)
         self.assertIn(
-            "(pid !== state.projectId || gen !== state.evalGen)", self.req)
+            "(pid !== state.projectId || gen !== state.evalGen ||", self.req)
+        self.assertIn("tq !== state.time)", self.req)
         self.assertIn("!state.evalQueued", self.req)
         # exactly three queue sites: single-flight, stale success, stale
         # failure — no other path may queue silently
@@ -276,11 +305,68 @@ class TestProjectDetailSequencing(unittest.TestCase):
         guard = self.req.index("state.project.id !== state.projectId")
         self.assertLess(guard, self.req.index("const tq = state.time;"))
 
+    def test_readout_instant_state_exists(self):
+        # the on-screen readout carries the exact instant it was computed
+        # for, so validity during a suspended switch can be judged from the
+        # displayed project + playhead instant
+        self.assertIn("readoutTime: null", self.flat)
+        # recorded on apply together with the cache key
+        apply_at = self.req.index("state.readoutKey = key;")
+        self.assertIn("state.readoutTime = tq;", self.req)
+        self.assertLess(apply_at, self.req.index("state.readoutTime = tq;"))
+        # and dropped at every place the readout itself is dropped:
+        # current-context eval failure, detail applied, mutation applied
+        self.assertEqual(self.src.count("state.readoutTime = null;"), 4)
+
+    def test_suspended_eval_withdraws_old_instant_readout(self):
+        # the suspended branch (detail in flight / failed) must not just
+        # return: when the playhead has left the readout's instant the old
+        # readout is withdrawn immediately so it cannot sit beside the new
+        # head position (and survive a rollback)
+        guard = self.req.index("if (!state.project || state.project.id !== state.projectId)")
+        head = self.req[guard:]
+        body = head.split("{", 1)[1].split("return;", 1)[0]
+        self.assertIn("withdrawStaleReadout();", body)
+
+    def test_readout_valid_only_for_displayed_project_and_instant(self):
+        # the withdrawal helper keeps the readout only while the on-screen
+        # project's readout instant still equals the live playhead time
+        helper = function_body(self.src, "function withdrawStaleReadout()")
+        self.assertIn("state.readoutTime === state.time", helper)
+        # and clears readouts / key / instant together, then re-renders
+        clear = helper.split("state.readoutTime === state.time", 1)[1]
+        self.assertIn("state.readouts = null;", clear)
+        self.assertIn("state.readoutKey = null;", clear)
+        self.assertIn("state.readoutTime = null;", clear)
+        self.assertIn("renderReadouts();", clear)
+
+    def test_latest_detail_failure_reevaluates_live_instant(self):
+        # after rolling back to the on-screen project, the failure path
+        # withdraws an old-instant readout and re-evaluates the restored
+        # project at the CURRENT playhead (A@t1, not A@t0)
+        catch = self.open.split("} catch (e) {", 1)[1]
+        restore = catch.index("state.projectId = state.project")
+        withdraw = catch.index("withdrawStaleReadout();")
+        reeval = catch.index("requestEval(true);")
+        toast_at = catch.index("toast(e.message);")
+        self.assertLess(restore, reeval)
+        self.assertLess(toast_at, reeval)
+        self.assertLess(withdraw, reeval)
+
+    def test_latest_detail_failure_does_not_restore_generation(self):
+        # restoring evalGen would let a pre-switch cached/in-flight readout
+        # pass the freshness checks of the rolled-back context
+        catch = self.open.split("} catch (e) {", 1)[1]
+        self.assertNotIn("evalGen -= 1", catch)
+        self.assertNotIn("evalGen =", catch)
+
     def test_valid_detail_still_triggers_live_eval(self):
         # the applied detail is what settles the readouts on the current
-        # instant of the last-selected project
-        apply_at = self.open.index("state.project = payload;")
-        eval_at = self.open.index("await requestEval(true);")
+        # instant of the last-selected project (scope to the success path
+        # after the last stale-ticket guard)
+        applied = self.open.rsplit("if (seq !== state.openSeq) return;", 1)[1]
+        apply_at = applied.index("state.project = payload;")
+        eval_at = applied.index("await requestEval(true);")
         self.assertLess(apply_at, eval_at)
 
 
