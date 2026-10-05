@@ -28,6 +28,14 @@ const state = {
   // playhead instant in a different project or after an edit needs a fresh
   // /eval, never a cached readout taken from the old data.
   evalGen: 0,
+  // The evalGen of the project detail actually rendered on screen.  The
+  // screen (lanes + readouts) only ever describes state.project, stamped
+  // with this generation.  openProject bumps evalGen optimistically before
+  // the detail arrives; while that request is in flight projectGen lags
+  // behind and names the still-visible data.  On a failed latest switch the
+  // rollback restores evalGen back to it so the context (incl. the readout
+  // cache key) is exactly the one on screen.
+  projectGen: 0,
   // Monotonic ticket handed out by openProject: only the call holding the
   // latest ticket may apply its detail response.  Comparing project ids
   // cannot spot a stale detail request — in A→B→A the first A response
@@ -143,6 +151,11 @@ async function openProject(id) {
     // every later eval keep describing the same project — the failure
     // must not leave mismatched readouts behind — then surface the error.
     state.projectId = state.project ? state.project.id : null;
+    // Restore the data generation of the project still rendered: the bump
+    // taken for the failed switch no longer describes anything on screen,
+    // and restoring it makes the on-screen readout cache key describe the
+    // live context again.
+    state.evalGen = state.projectGen;
     if (state.projectId == null) {
       localStorage.removeItem("lightsProject");
     } else {
@@ -150,12 +163,20 @@ async function openProject(id) {
       $("#projectSelect").value = String(state.projectId);
     }
     toast(e.message);
+    // The playhead may have moved while the detail was in flight (those
+    // seeks were held back by requestEval); the on-screen readout is only
+    // valid for its own instant.  Recompute the rolled-back project at the
+    // live instant now — this replaces a t0 readout after a jump to t1
+    // (and clears it if the eval itself fails).
+    if (state.projectId != null) await requestEval(true);
     return;
   }
   // a newer selection superseded this request while it was in flight:
   // discard the late response instead of rebuilding the lanes with it
   if (seq !== state.openSeq) return;
   state.project = payload;
+  // the rendered screen now describes this project at the current gen
+  state.projectGen = state.evalGen;
   state.selectedId = null;
   buildLanes();
   // clear readouts from the old project before re-evaluating so switching
@@ -438,7 +459,20 @@ async function requestEval(immediate) {
   // already points at the next project, and evaluating it here would paint
   // its channels onto the lanes of the project still displayed.  The valid
   // detail response re-runs this for the live instant as soon as it lands.
-  if (!state.project || state.project.id !== state.projectId) return;
+  // The old readout, however, stays valid only while it still describes the
+  // on-screen project at the live playhead instant: if the playhead moved
+  // (e.g. a jump to t1 while the readout is still t0) take it down at once
+  // rather than show an old moment's channels next to the new head.
+  if (!state.project || state.project.id !== state.projectId) {
+    const shownKey =
+      `${state.project ? state.project.id : null}|${state.projectGen}|${state.time}`;
+    if (state.readouts != null && state.readoutKey !== shownKey) {
+      state.readouts = null;
+      state.readoutKey = null;
+      renderReadouts();
+    }
+    return;
+  }
   // the playhead is an arbitrary non-negative (possibly fractional) ms
   // value; send it verbatim — no rounding anywhere in the chain, so the
   // readout always matches a direct /eval call for this exact instant
@@ -478,11 +512,14 @@ async function requestEval(immediate) {
   try {
     const data = await api(
       `/api/projects/${pid}/eval?t=${encodeURIComponent(String(tq))}`);
-    // stale response guard: the project was switched or the data changed
-    // while the request was in flight.  Never overwrite the current view;
+    // stale response guard: the project was switched, the data changed, or
+    // the playhead moved to another instant while this request was in
+    // flight.  A response for an old moment must never be shown as the
+    // readout for the current one, so never overwrite the current view;
     // queue a re-run only if nothing already covers the current instant,
     // so the current data is evaluated without redundant requests.
-    if (pid !== state.projectId || gen !== state.evalGen) {
+    if (pid !== state.projectId || gen !== state.evalGen ||
+        tq !== state.time) {
       if (state.readoutKey !==
           `${state.projectId}|${state.evalGen}|${state.time}`) {
         state.evalQueued = true;
@@ -493,9 +530,11 @@ async function requestEval(immediate) {
     state.readoutKey = key;
     renderReadouts();
   } catch (e) {
-    // only the request for the current project/data may touch the display;
-    // a stale failure must not wipe readouts belonging to a newer context
-    if (pid === state.projectId && gen === state.evalGen) {
+    // only the request for the current project/data/instant may touch the
+    // display; a stale failure must not wipe readouts belonging to a newer
+    // context or toast its error
+    if (pid === state.projectId && gen === state.evalGen &&
+        tq === state.time) {
       // current project can't be evaluated: drop the stale readout (its
       // channels may no longer exist) and surface the error; readoutKey
       // stays null so a later retry is not deduped away
@@ -508,7 +547,8 @@ async function requestEval(immediate) {
     // for unless a newer eval of the live context is already in flight or
     // its result is cached; the shared finally block only re-runs when
     // something got queued, so ask it here.
-    if ((pid !== state.projectId || gen !== state.evalGen) &&
+    if ((pid !== state.projectId || gen !== state.evalGen ||
+         tq !== state.time) &&
         !state.evalQueued &&
         state.readoutKey !==
         `${state.projectId}|${state.evalGen}|${state.time}`) {
@@ -791,6 +831,9 @@ async function applyProjectPayload(payload) {
   // the data changed: invalidate any cached / in-flight eval for the old
   // data so the same playhead instant is re-evaluated against this project
   state.evalGen += 1;
+  // the mutation applied to the on-screen project: the screen now shows
+  // exactly this generation
+  state.projectGen = state.evalGen;
   const focus = payload.focus_item_id;
   state.selectedId = focus ?? state.selectedId;
   if (state.selectedId != null && !itemById(state.selectedId)) state.selectedId = null;
